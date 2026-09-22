@@ -11,7 +11,9 @@ use crate::{
     utils, DarkluaError,
 };
 
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use super::{
     instance_path::{get_parent_instance, script_identifier},
@@ -25,7 +27,9 @@ pub struct RobloxRequireMode {
     #[serde(default, deserialize_with = "crate::utils::string_or_struct")]
     indexing_style: RobloxIndexStyle,
     #[serde(skip)]
-    cached_sourcemap: Option<RojoSourcemap>,
+    cached_sourcemap: Option<Arc<RojoSourcemap>>,
+    #[serde(skip)]
+    parsed_sourcemap: ParsedSourcemap,
 }
 
 impl RobloxRequireMode {
@@ -37,22 +41,21 @@ impl RobloxRequireMode {
         {
             context.add_file_dependency(rojo_sourcemap_path.clone());
 
-            let sourcemap_parent_location = get_relative_parent_path(rojo_sourcemap_path);
-            let sourcemap = RojoSourcemap::parse(
-                &context
-                    .resources()
-                    .get(rojo_sourcemap_path)
-                    .map_err(|err| {
-                        DarkluaError::from(err).context("while initializing Roblox require mode")
-                    })?,
-                sourcemap_parent_location,
-            )
-            .map_err(|err| {
-                err.context(format!(
-                    "unable to parse Rojo sourcemap at `{}`",
-                    rojo_sourcemap_path.display()
-                ))
-            })?;
+            let content = context
+                .resources()
+                .get(rojo_sourcemap_path)
+                .map_err(|err| {
+                    DarkluaError::from(err).context("while initializing Roblox require mode")
+                })?;
+            let sourcemap = self
+                .parsed_sourcemap
+                .get_or_parse(rojo_sourcemap_path, content)
+                .map_err(|err| {
+                    err.context(format!(
+                        "unable to parse Rojo sourcemap at `{}`",
+                        rojo_sourcemap_path.display()
+                    ))
+                })?;
             self.cached_sourcemap = Some(sourcemap);
         }
         Ok(())
@@ -230,5 +233,97 @@ impl RobloxRequireMode {
                 source_path.display(),
             )))
         }
+    }
+}
+
+/// The last sourcemap parsed by a require mode. The rule clones its require mode for
+/// each processed file, and the clones share this value, so the sourcemap is only
+/// parsed again when its path or content changes.
+#[derive(Clone, Default)]
+struct ParsedSourcemap(Arc<Mutex<Option<ParsedSourcemapEntry>>>);
+
+struct ParsedSourcemapEntry {
+    path: PathBuf,
+    content: String,
+    sourcemap: Arc<RojoSourcemap>,
+}
+
+impl ParsedSourcemap {
+    fn get_or_parse(&self, path: &Path, content: String) -> DarkluaResult<Arc<RojoSourcemap>> {
+        let mut entry = self.0.lock().unwrap();
+
+        if let Some(entry) = entry
+            .as_ref()
+            .filter(|entry| entry.path == path && entry.content == content)
+        {
+            return Ok(Arc::clone(&entry.sourcemap));
+        }
+
+        let sourcemap = Arc::new(RojoSourcemap::parse(
+            &content,
+            get_relative_parent_path(path),
+        )?);
+        *entry = Some(ParsedSourcemapEntry {
+            path: path.to_path_buf(),
+            content,
+            sourcemap: Arc::clone(&sourcemap),
+        });
+        Ok(sourcemap)
+    }
+}
+
+impl fmt::Debug for ParsedSourcemap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParsedSourcemap").finish_non_exhaustive()
+    }
+}
+
+// a cache does not change how a require mode behaves
+impl PartialEq for ParsedSourcemap {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ParsedSourcemap {}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    const SOURCEMAP: &str =
+        r#"{ "name": "Project", "className": "ModuleScript", "filePaths": ["src/init.lua"] }"#;
+
+    #[test]
+    fn parsed_sourcemap_is_reused_while_content_is_unchanged() {
+        let parsed_sourcemap = ParsedSourcemap::default();
+        let path = Path::new("sourcemap.json");
+
+        let first = parsed_sourcemap
+            .get_or_parse(path, SOURCEMAP.to_owned())
+            .unwrap();
+        let second = parsed_sourcemap
+            .clone()
+            .get_or_parse(path, SOURCEMAP.to_owned())
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn parsed_sourcemap_is_parsed_again_when_content_changes() {
+        let parsed_sourcemap = ParsedSourcemap::default();
+        let path = Path::new("sourcemap.json");
+
+        let first = parsed_sourcemap
+            .get_or_parse(path, SOURCEMAP.to_owned())
+            .unwrap();
+        let second = parsed_sourcemap
+            .get_or_parse(path, SOURCEMAP.replace("init.lua", "main.lua"))
+            .unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(second.exists(Path::new("src/main.lua")));
+        assert!(!second.exists(Path::new("src/init.lua")));
     }
 }
