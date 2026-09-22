@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{utils, DarkluaError};
 
@@ -8,96 +9,29 @@ use super::InstancePath;
 
 type NodeId = usize;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RojoSourcemapNode {
     name: String,
     class_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     file_paths: Vec<PathBuf>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     children: Vec<RojoSourcemapNode>,
-    #[serde(skip)]
-    id: NodeId,
-    #[serde(skip)]
-    parent_id: NodeId,
-}
-
-impl RojoSourcemapNode {
-    fn initialize(mut self, relative_to: &Path) -> Self {
-        let mut queue = vec![&mut self];
-        let mut index = 0;
-
-        while let Some(node) = queue.pop() {
-            node.id = index;
-            for file_path in &mut node.file_paths {
-                *file_path = utils::normalize_path(relative_to.join(&file_path));
-            }
-            for child in &mut node.children {
-                child.parent_id = index;
-                queue.push(child);
-            }
-            index += 1;
-        }
-
-        self
-    }
-
-    fn id(&self) -> NodeId {
-        self.id
-    }
-
-    fn parent_id(&self) -> NodeId {
-        self.parent_id
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &Self> {
-        RojoSourcemapNodeIterator::new(self)
-    }
-
-    fn get_child(&self, id: NodeId) -> Option<&RojoSourcemapNode> {
-        self.children.iter().find(|node| node.id == id)
-    }
-
-    fn get_descendant(&self, id: NodeId) -> Option<&RojoSourcemapNode> {
-        self.iter().find(|node| node.id == id)
-    }
-
-    fn is_root(&self) -> bool {
-        self.id == self.parent_id
-    }
-}
-
-struct RojoSourcemapNodeIterator<'a> {
-    queue: Vec<&'a RojoSourcemapNode>,
-}
-
-impl<'a> RojoSourcemapNodeIterator<'a> {
-    fn new(root_node: &'a RojoSourcemapNode) -> Self {
-        Self {
-            queue: vec![root_node],
-        }
-    }
-}
-
-impl<'a> Iterator for RojoSourcemapNodeIterator<'a> {
-    type Item = &'a RojoSourcemapNode;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(next_node) = self.queue.pop() {
-            for child in &next_node.children {
-                self.queue.push(child);
-            }
-            Some(next_node)
-        } else {
-            None
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexedNode {
+    name: String,
+    parent_id: NodeId,
+}
+
+/// A Rojo sourcemap flattened into a list of nodes indexed by id, where the root
+/// node has id 0 and is its own parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RojoSourcemap {
-    root_node: RojoSourcemapNode,
+    nodes: Vec<IndexedNode>,
+    node_ids_by_path: HashMap<PathBuf, NodeId>,
     is_datamodel: bool,
 }
 
@@ -106,18 +40,38 @@ impl RojoSourcemap {
         content: &str,
         relative_to: impl AsRef<Path>,
     ) -> Result<Self, DarkluaError> {
-        let root_node =
-            serde_json::from_str::<RojoSourcemapNode>(content)?.initialize(relative_to.as_ref());
-
+        let root_node = serde_json::from_str::<RojoSourcemapNode>(content)?;
+        let relative_to = relative_to.as_ref();
         let is_datamodel = root_node.class_name == "DataModel";
+
+        let mut nodes = Vec::new();
+        let mut node_ids_by_path = HashMap::new();
+        let mut queue = vec![(root_node, 0)];
+
+        while let Some((node, parent_id)) = queue.pop() {
+            let id = nodes.len();
+            for file_path in node.file_paths {
+                // when a file path appears on multiple nodes, the first node visited wins
+                node_ids_by_path
+                    .entry(utils::normalize_path(relative_to.join(file_path)))
+                    .or_insert(id);
+            }
+            nodes.push(IndexedNode {
+                name: node.name,
+                parent_id,
+            });
+            queue.extend(node.children.into_iter().map(|child| (child, id)));
+        }
+
         Ok(Self {
-            root_node,
+            nodes,
+            node_ids_by_path,
             is_datamodel,
         })
     }
 
     pub(crate) fn exists(&self, path: &Path) -> bool {
-        self.find_node(path).is_some()
+        self.node_ids_by_path.contains_key(path)
     }
 
     pub(crate) fn get_instance_path(
@@ -128,35 +82,27 @@ impl RojoSourcemap {
         let from_file = from_file.as_ref();
         let target_file = target_file.as_ref();
 
-        let from_node = self.find_node(from_file)?;
-        let target_node = self.find_node(target_file)?;
+        let from_node = *self.node_ids_by_path.get(from_file)?;
+        let target_node = *self.node_ids_by_path.get(target_file)?;
 
         let from_ancestors = self.hierarchy(from_node);
         let target_ancestors = self.hierarchy(target_node);
 
-        let (parents, descendants, common_ancestor_id) = from_ancestors
+        let (parents, descendants) = from_ancestors
             .iter()
             .enumerate()
             .find_map(|(index, ancestor_id)| {
-                if let Some((target_index, common_ancestor_id)) = target_ancestors
+                target_ancestors
                     .iter()
-                    .enumerate()
-                    .find(|(_, id)| *id == ancestor_id)
-                {
-                    Some((index, target_index, *common_ancestor_id))
-                } else {
-                    None
-                }
+                    .position(|id| id == ancestor_id)
+                    .map(|target_index| (index, target_index))
             })
-            .map(
-                |(from_ancestor_split, target_ancestor_split, common_ancestor_id)| {
-                    (
-                        from_ancestors.split_at(from_ancestor_split).0,
-                        target_ancestors.split_at(target_ancestor_split).0,
-                        common_ancestor_id,
-                    )
-                },
-            )?;
+            .map(|(from_ancestor_split, target_ancestor_split)| {
+                (
+                    from_ancestors.split_at(from_ancestor_split).0,
+                    target_ancestors.split_at(target_ancestor_split).0,
+                )
+            })?;
 
         let relative_path_length = parents.len().saturating_add(descendants.len());
 
@@ -169,60 +115,39 @@ impl RojoSourcemap {
                 instance_path.parent();
             }
 
-            self.index_descendants(
-                instance_path,
-                self.root_node.get_descendant(common_ancestor_id)?,
-                descendants.iter().rev(),
-            )
+            Some(self.index_descendants(instance_path, descendants.iter().rev()))
         } else {
             log::trace!("  ⨽ use Roblox path from DataModel instance");
 
-            self.index_descendants(
+            Some(self.index_descendants(
                 InstancePath::from_root(),
-                &self.root_node,
                 target_ancestors.iter().rev().skip(1),
-            )
+            ))
         }
     }
 
     fn index_descendants<'a>(
         &self,
         mut instance_path: InstancePath,
-        mut node: &RojoSourcemapNode,
-        descendants: impl Iterator<Item = &'a usize>,
-    ) -> Option<InstancePath> {
+        descendants: impl Iterator<Item = &'a NodeId>,
+    ) -> InstancePath {
         for descendant_id in descendants {
-            node = node.get_child(*descendant_id)?;
-            instance_path.child(&node.name);
+            instance_path.child(&self.nodes[*descendant_id].name);
         }
-        Some(instance_path)
+        instance_path
     }
 
     /// returns the ids of each ancestor of the given node and itself
-    fn hierarchy(&self, node: &RojoSourcemapNode) -> Vec<NodeId> {
-        let mut ids = vec![node.id()];
+    fn hierarchy(&self, node_id: NodeId) -> Vec<NodeId> {
+        let mut ids = vec![node_id];
+        let mut current_id = node_id;
 
-        if node.is_root() {
-            return ids;
-        }
-
-        let mut parent_id = node.parent_id();
-
-        while let Some(parent) = self.root_node.get_descendant(parent_id) {
-            ids.push(parent_id);
-            if parent.is_root() {
-                break;
-            }
-            parent_id = parent.parent_id();
+        while current_id != 0 {
+            current_id = self.nodes[current_id].parent_id;
+            ids.push(current_id);
         }
 
         ids
-    }
-
-    fn find_node(&self, path: &Path) -> Option<&RojoSourcemapNode> {
-        self.root_node
-            .iter()
-            .find(|node| node.file_paths.iter().any(|file_path| file_path == path))
     }
 }
 
